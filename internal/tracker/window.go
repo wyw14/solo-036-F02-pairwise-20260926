@@ -2,18 +2,9 @@ package tracker
 
 import "time"
 
+// Clearance reports whether the coordinator's current points at the station
+// form an unbroken observation chain. Prefer tracker.Continuous over a
+// lineage-derived evidence set when reassessing after a withdrawal.
 func (c *Coordinator) Clearance(runID, station string, maxGap time.Duration) bool {
-	points := c.Evidence(runID, station)
-	if len(points) < 2 {
-		return false
-	}
-	for i := 1; i < len(points); i++ {
-		if points[i].At.Sub(points[i-1].At) > maxGap {
-			return false
-		}
-		if points[i].Generation != points[0].Generation {
-			return false
-		}
-	}
-	return true
+	return Continuous(c.Evidence(runID, station), maxGap)
 }

@@ -47,6 +47,25 @@ type passageRequest struct {
 	StationID string `json:"station_id"`
 }
 
+type withdrawRequest struct {
+	StationID     string           `json:"station_id"`
+	ObservationID string           `json:"observation_id"`
+	Reason        string           `json:"reason"`
+	Correction    *trackCorrection `json:"correction"`
+}
+
+type trackCorrection struct {
+	SourceID   string  `json:"source_id"`
+	Kind       string  `json:"kind"`
+	Position   float64 `json:"position"`
+	ObservedAt string  `json:"observed_at"`
+}
+
+type resolveReviewRequest struct {
+	StationID  string `json:"station_id"`
+	Resolution string `json:"resolution"`
+}
+
 func decodeBody(w http.ResponseWriter, r *http.Request, destination any) error {
 	reader := http.MaxBytesReader(w, r.Body, requestLimit)
 	defer reader.Close()
@@ -147,6 +166,79 @@ func (h *Handler) ReviseTracking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"generation": generation})
+}
+
+func (h *Handler) WithdrawObservation(w http.ResponseWriter, r *http.Request) {
+	var request withdrawRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	input := service.WithdrawObservationRequest{
+		StationID:     request.StationID,
+		ObservationID: request.ObservationID,
+		Reason:        request.Reason,
+	}
+	if request.Correction != nil {
+		observedAt, err := parseObservedAt(request.Correction.ObservedAt)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, err)
+			return
+		}
+		input.Correction = &service.CorrectionInput{
+			SourceID:   request.Correction.SourceID,
+			Kind:       tracker.SourceKind(request.Correction.Kind),
+			Position:   request.Correction.Position,
+			ObservedAt: observedAt,
+		}
+	}
+	operation, err := h.runtime.WithdrawObservation(chi.URLParam(r, "runID"), input)
+	if err != nil {
+		writeError(w, r, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, operation)
+}
+
+func (h *Handler) ReassessPassage(w http.ResponseWriter, r *http.Request) {
+	var request passageRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	reassessment, err := h.runtime.ReassessPassage(chi.URLParam(r, "runID"), request.StationID)
+	if err != nil {
+		writeError(w, r, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, reassessment)
+}
+
+func (h *Handler) Observations(w http.ResponseWriter, r *http.Request) {
+	stationID := r.URL.Query().Get("station_id")
+	if strings.TrimSpace(stationID) == "" {
+		writeError(w, r, http.StatusBadRequest, errors.New("station_id query parameter is required"))
+		return
+	}
+	observations, err := h.runtime.ObservationHistory(chi.URLParam(r, "runID"), stationID)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"observations": observations})
+}
+
+func (h *Handler) ResolveReview(w http.ResponseWriter, r *http.Request) {
+	var request resolveReviewRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.runtime.ResolveReview(chi.URLParam(r, "runID"), request.StationID, request.Resolution); err != nil {
+		writeError(w, r, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "resolved"})
 }
 
 func (h *Handler) GrantPassage(w http.ResponseWriter, r *http.Request) {

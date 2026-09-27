@@ -80,22 +80,29 @@ type RouteState struct {
 }
 
 type TrackingState struct {
-	RunID      string    `json:"run_id"`
-	StationID  string    `json:"station_id"`
-	SourceID   string    `json:"source_id"`
-	Generation int64     `json:"generation"`
-	Position   float64   `json:"position"`
-	Online     bool      `json:"online"`
-	ObservedAt time.Time `json:"observed_at"`
+	RunID                 string    `json:"run_id"`
+	StationID             string    `json:"station_id"`
+	SourceID              string    `json:"source_id"`
+	ObservationID         string    `json:"observation_id,omitempty"`
+	CorrectsObservationID string    `json:"corrects_observation_id,omitempty"`
+	Kind                  string    `json:"kind,omitempty"`
+	Generation            int64     `json:"generation"`
+	Position              float64   `json:"position"`
+	Online                bool      `json:"online"`
+	Withdrawn             bool      `json:"withdrawn,omitempty"`
+	WithdrawReason        string    `json:"withdraw_reason,omitempty"`
+	ReviewRequired        bool      `json:"review_required,omitempty"`
+	ObservedAt            time.Time `json:"observed_at"`
 }
 
 type PermitState struct {
-	RunID      string    `json:"run_id"`
-	Name       string    `json:"name"`
-	Generation int64     `json:"generation"`
-	Granted    bool      `json:"granted"`
-	Reason     string    `json:"reason"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	RunID          string    `json:"run_id"`
+	Name           string    `json:"name"`
+	Generation     int64     `json:"generation"`
+	Granted        bool      `json:"granted"`
+	Reason         string    `json:"reason"`
+	ReviewRequired bool      `json:"review_required,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type OperationRecord struct {
@@ -104,6 +111,7 @@ type OperationRecord struct {
 	Pressure  PressureState   `json:"pressure"`
 	Tracking  []TrackingState `json:"tracking"`
 	Permits   []PermitState   `json:"permits"`
+	Reviews   []RunReview     `json:"reviews,omitempty"`
 	LastError string          `json:"last_error,omitempty"`
 }
 
@@ -117,6 +125,7 @@ type ControlSnapshot struct {
 	Routes     []RouteState    `json:"routes"`
 	Tracking   []TrackingState `json:"tracking"`
 	Permits    []PermitState   `json:"permits"`
+	Reviews    []RunReview     `json:"reviews,omitempty"`
 	Runs       []Run           `json:"runs"`
 	Incidents  []Incident      `json:"incidents"`
 }
@@ -268,6 +277,11 @@ func (s ControlSnapshot) Validate() error {
 			return fmt.Errorf("permit %s: %w", permit.Name, err)
 		}
 	}
+	for _, review := range s.Reviews {
+		if err := review.Validate(); err != nil {
+			return fmt.Errorf("review %s/%s: %w", review.RunID, review.StationID, err)
+		}
+	}
 	return nil
 }
 
@@ -315,6 +329,11 @@ func (s ControlSnapshot) Operation(runID string) (OperationRecord, bool) {
 	for _, permit := range s.Permits {
 		if permit.RunID == runID {
 			result.Permits = append(result.Permits, permit)
+		}
+	}
+	for _, review := range s.Reviews {
+		if review.RunID == runID {
+			result.Reviews = append(result.Reviews, review)
 		}
 	}
 	return result, true

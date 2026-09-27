@@ -28,6 +28,7 @@ type ControlState struct {
 	Pressures  map[string]model.PressureState
 	Tracking   map[string][]model.TrackingState
 	Permits    map[string][]model.PermitState
+	Reviews    []model.RunReview
 	Incidents  []model.Incident
 	Revision   string
 	Persistent *journal.FileStore
@@ -72,6 +73,7 @@ func defaultControlState() *ControlState {
 		Pressures: make(map[string]model.PressureState),
 		Tracking:  make(map[string][]model.TrackingState),
 		Permits:   make(map[string][]model.PermitState),
+		Reviews:   make([]model.RunReview, 0),
 		Incidents: make([]model.Incident, 0),
 		Revision:  model.NewRevision(),
 	}
@@ -305,32 +307,35 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 	if request.Kind == "" {
 		request.Kind = tracker.SourceMagnetic
 	}
-	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
+	observationID := model.NewRevision()
 	if err := r.Lineage.Add(tracker.SourceObservation{
 		RunID:            runID,
 		StationID:        request.StationID,
-		ObservationID:    model.NewRevision(),
+		ObservationID:    observationID,
 		PhysicalSourceID: request.SourceID,
 		Kind:             request.Kind,
 		Position:         request.Position,
-		Generation:       evidence.Generation,
+		Generation:       r.Tracker.Generation(runID),
 		ObservedAt:       request.ObservedAt,
 		Valid:            true,
 	}); err != nil {
 		return model.OperationRecord{}, err
 	}
+	evidence := r.Tracker.ObserveWithID(observationID, runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
 	if err := r.Routes.Advance(runID, request.Position); err != nil {
 		r.recordIncident(runID, "warning", err.Error())
 		return model.OperationRecord{}, err
 	}
 	state := model.TrackingState{
-		RunID:      runID,
-		StationID:  request.StationID,
-		SourceID:   request.SourceID,
-		Generation: evidence.Generation,
-		Position:   request.Position,
-		Online:     true,
-		ObservedAt: request.ObservedAt,
+		RunID:         runID,
+		StationID:     request.StationID,
+		SourceID:      request.SourceID,
+		ObservationID: observationID,
+		Kind:          string(request.Kind),
+		Generation:    evidence.Generation,
+		Position:      request.Position,
+		Online:        true,
+		ObservedAt:    request.ObservedAt,
 	}
 	r.mu.Lock()
 	r.control.Tracking[runID] = append(r.control.Tracking[runID], state)
@@ -358,7 +363,7 @@ func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, 
 	if len(points) < 2 {
 		return model.OperationRecord{}, errors.New("insufficient passage evidence")
 	}
-	if !r.Tracker.Clearance(runID, stationID, 90*time.Second) {
+	if !tracker.Continuous(points, PassageMaxGap) {
 		return model.OperationRecord{}, errors.New("passage evidence is not continuous")
 	}
 	if !r.Tracker.ArrivalQuorum(points, 2) || !tracker.IndependentPhysicalArrival(points, 2) {
@@ -511,6 +516,7 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 		Permits:    make([]model.PermitState, 0),
 		Runs:       r.Runs.Snapshot(),
 		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Reviews:    append([]model.RunReview(nil), control.Reviews...),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -598,6 +604,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Pressures = make(map[string]model.PressureState)
 	r.control.Tracking = make(map[string][]model.TrackingState)
 	r.control.Permits = make(map[string][]model.PermitState)
+	r.control.Reviews = make([]model.RunReview, 0, len(snapshot.Control.Reviews))
 	for _, value := range snapshot.Control.Routes {
 		r.control.Routes[value.ID] = value
 	}
@@ -616,9 +623,11 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	for _, value := range snapshot.Control.Permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
 	}
+	r.control.Reviews = append(r.control.Reviews, snapshot.Control.Reviews...)
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	r.restoreLineage(snapshot.Control.Tracking)
 	events, err := control.Persistent.Events()
 	if err != nil {
 		return RecoveryReport{}, err
