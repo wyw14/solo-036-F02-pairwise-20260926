@@ -16,6 +16,8 @@ func NewRouter(runtime *service.Runtime) http.Handler {
 		r.Get("/operations/{runID}", h.Operation)
 		r.Post("/operations/{runID}/tracking", h.Track)
 		r.Post("/operations/{runID}/tracking/revision", h.ReviseTracking)
+		r.Post("/operations/{runID}/tracking/withdrawal", h.WithdrawObservation)
+		r.Get("/operations/{runID}/lineage", h.Lineage)
 		r.Post("/operations/{runID}/passage", h.GrantPassage)
 		r.Post("/operations/{runID}/receive", h.Receive)
 		r.Post("/operations/{runID}/complete", h.Complete)

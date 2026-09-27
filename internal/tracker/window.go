@@ -1,9 +1,17 @@
 package tracker
 
-import "time"
+import (
+	"time"
 
-func (c *Coordinator) Clearance(runID, station string, maxGap time.Duration) bool {
-	points := c.Evidence(runID, station)
+	"github.com/wyw14/solo-036/internal/model"
+)
+
+// Continuous reports whether the evidence forms an unbroken chain: at least
+// two points, all from the same generation, and no gap between adjacent
+// observations (in observation order) larger than maxGap. It operates on the
+// evidence it is given, so callers can recompute continuity after a source is
+// withdrawn without touching the live coordinator.
+func Continuous(points []model.PassageEvidence, maxGap time.Duration) bool {
 	if len(points) < 2 {
 		return false
 	}
@@ -16,4 +24,8 @@ func (c *Coordinator) Clearance(runID, station string, maxGap time.Duration) boo
 		}
 	}
 	return true
+}
+
+func (c *Coordinator) Clearance(runID, station string, maxGap time.Duration) bool {
+	return Continuous(c.Evidence(runID, station), maxGap)
 }

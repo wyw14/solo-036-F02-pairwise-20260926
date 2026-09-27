@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,17 +41,40 @@ type LaunchRequest struct {
 }
 
 type TrackingRequest struct {
-	StationID  string             `json:"station_id"`
-	SourceID   string             `json:"source_id"`
-	Kind       tracker.SourceKind `json:"kind"`
-	Position   float64            `json:"position"`
-	ObservedAt time.Time          `json:"observed_at"`
+	StationID             string             `json:"station_id"`
+	SourceID              string             `json:"source_id"`
+	Kind                  tracker.SourceKind `json:"kind"`
+	Position              float64            `json:"position"`
+	ObservedAt            time.Time          `json:"observed_at"`
+	CorrectsObservationID string             `json:"corrects_observation_id,omitempty"`
 }
 
 type ReceiveRequest struct {
 	StationID      string `json:"station_id"`
 	IsolationEpoch int64  `json:"isolation_epoch"`
 }
+
+type WithdrawObservationRequest struct {
+	ObservationID string `json:"observation_id"`
+	Reason        string `json:"reason"`
+}
+
+// LineageReport exposes the full observation lineage: the original
+// observations (including withdrawn ones), the correction ledger, the
+// recomputed passage basis and the review flags on affected run decisions.
+type LineageReport struct {
+	RunID          string                      `json:"run_id"`
+	Observations   []tracker.SourceObservation `json:"observations"`
+	Corrections    []tracker.Correction        `json:"corrections"`
+	Bases          []tracker.PassageBasis      `json:"bases"`
+	Reviews        []tracker.PassageReview     `json:"reviews"`
+	ReviewRequired bool                        `json:"review_required"`
+}
+
+const (
+	passageRequired = 2
+	passageGap      = 90 * time.Second
+)
 
 type RecoveryReport struct {
 	RecoveredRuns    int  `json:"recovered_runs"`
@@ -305,32 +329,51 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 	if request.Kind == "" {
 		request.Kind = tracker.SourceMagnetic
 	}
-	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, request.Position, request.ObservedAt)
-	if err := r.Lineage.Add(tracker.SourceObservation{
-		RunID:            runID,
-		StationID:        request.StationID,
-		ObservationID:    model.NewRevision(),
-		PhysicalSourceID: request.SourceID,
-		Kind:             request.Kind,
-		Position:         request.Position,
-		Generation:       evidence.Generation,
-		ObservedAt:       request.ObservedAt,
-		Valid:            true,
-	}); err != nil {
+	observationID := model.NewRevision()
+	evidence := r.Tracker.Observe(runID, request.StationID, request.SourceID, observationID, request.Position, request.ObservedAt)
+	correction, err := r.Lineage.Add(tracker.SourceObservation{
+		RunID:                 runID,
+		StationID:             request.StationID,
+		ObservationID:         observationID,
+		PhysicalSourceID:      request.SourceID,
+		CorrectsObservationID: request.CorrectsObservationID,
+		Kind:                  request.Kind,
+		Position:              request.Position,
+		Generation:            evidence.Generation,
+		ObservedAt:            request.ObservedAt,
+		Valid:                 true,
+	})
+	if err != nil {
+		r.Tracker.Retract(observationID)
 		return model.OperationRecord{}, err
+	}
+	// A correction withdraws the mistyped observation (and anything derived
+	// from it); drop the same live points so continuity is recomputed without
+	// bumping the generation.
+	if correction != nil {
+		r.Tracker.Retract(correction.PrimaryID)
+		for _, cascadedID := range correction.CascadedIDs {
+			r.Tracker.Retract(cascadedID)
+		}
+		reviewReason := fmt.Sprintf("observation %s corrected by %s", correction.PrimaryID, observationID)
+		affected := r.Lineage.MarkAffectedReviews(runID,
+			append([]string{correction.PrimaryID}, correction.CascadedIDs...),
+			reviewReason, passageRequired, passageGap)
+		r.markPermitsForReview(runID, affected, reviewReason)
 	}
 	if err := r.Routes.Advance(runID, request.Position); err != nil {
 		r.recordIncident(runID, "warning", err.Error())
 		return model.OperationRecord{}, err
 	}
 	state := model.TrackingState{
-		RunID:      runID,
-		StationID:  request.StationID,
-		SourceID:   request.SourceID,
-		Generation: evidence.Generation,
-		Position:   request.Position,
-		Online:     true,
-		ObservedAt: request.ObservedAt,
+		RunID:         runID,
+		StationID:     request.StationID,
+		SourceID:      request.SourceID,
+		ObservationID: observationID,
+		Generation:    evidence.Generation,
+		Position:      request.Position,
+		Online:        true,
+		ObservedAt:    request.ObservedAt,
 	}
 	r.mu.Lock()
 	r.control.Tracking[runID] = append(r.control.Tracking[runID], state)
@@ -340,7 +383,7 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 		RunID:   runID,
 		Kind:    "tracking",
 		Epoch:   evidence.Generation,
-		Payload: fmt.Sprintf("%s/%s/%.3f", request.StationID, request.SourceID, request.Position),
+		Payload: fmt.Sprintf("%s/%s/%s/%.3f", request.StationID, observationID, request.SourceID, request.Position),
 		At:      request.ObservedAt,
 	}); err != nil {
 		return model.OperationRecord{}, err
@@ -354,32 +397,44 @@ func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, 
 		return model.OperationRecord{}, errors.New("unknown passage station")
 	}
 	generation := r.Tracker.Generation(runID)
-	points := r.Lineage.Evidence(runID, stationID, generation)
-	if len(points) < 2 {
+	basis := r.Lineage.Basis(runID, stationID, generation, passageRequired, passageGap)
+	if len(basis.Evidence) < passageRequired {
 		return model.OperationRecord{}, errors.New("insufficient passage evidence")
 	}
-	if !r.Tracker.Clearance(runID, stationID, 90*time.Second) {
+	if !basis.Continuous {
 		return model.OperationRecord{}, errors.New("passage evidence is not continuous")
 	}
-	if !r.Tracker.ArrivalQuorum(points, 2) || !tracker.IndependentPhysicalArrival(points, 2) {
+	if !basis.Quorum || !basis.Independent {
 		return model.OperationRecord{}, errors.New("passage evidence does not have independent physical sources")
 	}
-	proof := points[len(points)-1]
+	proof := basis.Evidence[len(basis.Evidence)-1]
 	if !permit.EvaluateRepressurization(r.Journal, r.Permits, proof) {
 		return model.OperationRecord{}, errors.New("passage proof was not durable")
 	}
+	now := time.Now().UTC()
+	r.Lineage.RecordPassageGrant(runID, stationID, generation, proof.ObservationID, passageRequired, passageGap, now)
 	permitState := model.PermitState{
 		RunID:      runID,
+		StationID:  stationID,
 		Name:       "repressurization",
 		Generation: proof.Generation,
 		Granted:    true,
 		Reason:     "continuous durable passage evidence",
-		UpdatedAt:  time.Now().UTC(),
+		UpdatedAt:  now,
 	}
 	r.mu.Lock()
 	r.control.Permits[runID] = append(r.control.Permits[runID], permitState)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	if err := r.appendEvent(model.Event{
+		RunID:   runID,
+		Kind:    "passage_granted",
+		Epoch:   generation,
+		Payload: fmt.Sprintf("%s/%s", stationID, proof.ObservationID),
+		At:      now,
+	}); err != nil {
+		return model.OperationRecord{}, err
+	}
 	return r.Operation(runID)
 }
 
@@ -734,6 +789,123 @@ func (r *Runtime) ReviseTracking(runID string) (int64, error) {
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
 	return generation, nil
+}
+
+// WithdrawObservation retracts a mistyped probe observation. The original
+// observation and the correction relationship are retained, the passage basis
+// (physical-source independence and continuity) is recomputed from the
+// remaining observations without bumping the generation, and any passage
+// decision that relied on the withdrawn source is flagged for review.
+func (r *Runtime) WithdrawObservation(runID string, request WithdrawObservationRequest) (LineageReport, error) {
+	observationID := strings.TrimSpace(request.ObservationID)
+	if observationID == "" {
+		return LineageReport{}, errors.New("observation id is required")
+	}
+	if _, ok := r.Runs.Get(runID); !ok {
+		return LineageReport{}, fmt.Errorf("run %s not found", runID)
+	}
+	observation, ok := r.Lineage.Get(observationID)
+	if !ok {
+		return LineageReport{}, errors.New("observation does not exist")
+	}
+	if observation.RunID != runID {
+		return LineageReport{}, errors.New("observation belongs to a different run")
+	}
+	if observation.Status == tracker.ObservationWithdrawn {
+		return LineageReport{}, errors.New("observation has already been withdrawn")
+	}
+	reason := strings.TrimSpace(request.Reason)
+	if reason == "" {
+		reason = "operator withdrawal"
+	}
+	withdrawnAt := time.Now().UTC()
+	withdrawn, withdrawnIDs, err := r.Lineage.Withdraw(observationID, reason, withdrawnAt)
+	if err != nil {
+		return LineageReport{}, err
+	}
+	// Remove the live points so Clearance/quorum recompute over the rest of
+	// the same generation.
+	for _, id := range withdrawnIDs {
+		r.Tracker.Retract(id)
+	}
+	reviewReason := fmt.Sprintf("observation %s withdrawn: %s", observationID, reason)
+	affected := r.Lineage.MarkAffectedReviews(runID, withdrawnIDs, reviewReason, passageRequired, passageGap)
+	r.markPermitsForReview(runID, affected, reviewReason)
+	payload := fmt.Sprintf("%s/%s/%s", withdrawn.StationID, observationID, reason)
+	if err := r.appendEvent(model.Event{
+		RunID:   runID,
+		Kind:    "tracking_withdrawal",
+		Epoch:   withdrawn.Generation,
+		Payload: payload,
+		At:      withdrawnAt,
+	}); err != nil {
+		return LineageReport{}, err
+	}
+	return r.buildLineageReport(runID), nil
+}
+
+// LineageReport returns the preserved observation history, correction ledger,
+// recomputed bases and review flags for a run.
+func (r *Runtime) LineageReport(runID string) (LineageReport, error) {
+	if _, ok := r.Runs.Get(runID); !ok {
+		return LineageReport{}, fmt.Errorf("run %s not found", runID)
+	}
+	return r.buildLineageReport(runID), nil
+}
+
+func (r *Runtime) buildLineageReport(runID string) LineageReport {
+	observations := r.Lineage.RunHistory(runID)
+	seen := make(map[string]bool)
+	bases := make([]tracker.PassageBasis, 0)
+	for _, observation := range observations {
+		key := observation.StationID + "/" + strconv.FormatInt(observation.Generation, 10)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		bases = append(bases, r.Lineage.Basis(runID, observation.StationID, observation.Generation, passageRequired, passageGap))
+	}
+	sort.Slice(bases, func(i, j int) bool {
+		if bases[i].StationID == bases[j].StationID {
+			return bases[i].Generation < bases[j].Generation
+		}
+		return bases[i].StationID < bases[j].StationID
+	})
+	return LineageReport{
+		RunID:          runID,
+		Observations:   observations,
+		Corrections:    r.Lineage.CorrectionsForRun(runID),
+		Bases:          bases,
+		Reviews:        r.Lineage.Reviews(runID),
+		ReviewRequired: r.Lineage.ReviewRequired(runID),
+	}
+}
+
+// markPermitsForReview flags granted permits whose recorded basis intersects
+// a withdrawn observation. The permits are not revoked: they await operator
+// re-check.
+func (r *Runtime) markPermitsForReview(runID string, affected []tracker.PassageReview, reason string) {
+	if len(affected) == 0 {
+		return
+	}
+	keys := make(map[string]bool, len(affected))
+	for _, review := range affected {
+		keys[review.StationID+"/"+strconv.FormatInt(review.Generation, 10)] = true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, permitState := range r.control.Permits[runID] {
+		if !permitState.Granted || permitState.ReviewRequired {
+			continue
+		}
+		if keys[permitState.StationID+"/"+strconv.FormatInt(permitState.Generation, 10)] {
+			permitState.ReviewRequired = true
+			permitState.ReviewReason = reason
+			permitState.UpdatedAt = time.Now().UTC()
+			r.control.Permits[runID][i] = permitState
+		}
+	}
+	r.control.Revision = model.NewRevision()
 }
 
 func errorText(err error) string {

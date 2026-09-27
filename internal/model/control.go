@@ -80,22 +80,26 @@ type RouteState struct {
 }
 
 type TrackingState struct {
-	RunID      string    `json:"run_id"`
-	StationID  string    `json:"station_id"`
-	SourceID   string    `json:"source_id"`
-	Generation int64     `json:"generation"`
-	Position   float64   `json:"position"`
-	Online     bool      `json:"online"`
-	ObservedAt time.Time `json:"observed_at"`
+	RunID         string    `json:"run_id"`
+	StationID     string    `json:"station_id"`
+	SourceID      string    `json:"source_id"`
+	ObservationID string    `json:"observation_id,omitempty"`
+	Generation    int64     `json:"generation"`
+	Position      float64   `json:"position"`
+	Online        bool      `json:"online"`
+	ObservedAt    time.Time `json:"observed_at"`
 }
 
 type PermitState struct {
-	RunID      string    `json:"run_id"`
-	Name       string    `json:"name"`
-	Generation int64     `json:"generation"`
-	Granted    bool      `json:"granted"`
-	Reason     string    `json:"reason"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	RunID          string    `json:"run_id"`
+	StationID      string    `json:"station_id,omitempty"`
+	Name           string    `json:"name"`
+	Generation     int64     `json:"generation"`
+	Granted        bool      `json:"granted"`
+	Reason         string    `json:"reason"`
+	ReviewRequired bool      `json:"review_required,omitempty"`
+	ReviewReason   string    `json:"review_reason,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type OperationRecord struct {

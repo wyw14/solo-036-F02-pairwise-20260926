@@ -27,11 +27,17 @@ type createRequest struct {
 }
 
 type trackRequest struct {
-	StationID  string  `json:"station_id"`
-	SourceID   string  `json:"source_id"`
-	Kind       string  `json:"kind"`
-	Position   float64 `json:"position"`
-	ObservedAt string  `json:"observed_at"`
+	StationID             string  `json:"station_id"`
+	SourceID              string  `json:"source_id"`
+	Kind                  string  `json:"kind"`
+	Position              float64 `json:"position"`
+	ObservedAt            string  `json:"observed_at"`
+	CorrectsObservationID string  `json:"corrects_observation_id"`
+}
+
+type withdrawObservationRequest struct {
+	ObservationID string `json:"observation_id"`
+	Reason        string `json:"reason"`
 }
 
 type receiveRequest struct {
@@ -127,17 +133,44 @@ func (h *Handler) Track(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operation, err := h.runtime.Track(chi.URLParam(r, "runID"), service.TrackingRequest{
-		StationID:  request.StationID,
-		SourceID:   request.SourceID,
-		Kind:       tracker.SourceKind(request.Kind),
-		Position:   request.Position,
-		ObservedAt: observedAt,
+		StationID:             request.StationID,
+		SourceID:              request.SourceID,
+		Kind:                  tracker.SourceKind(request.Kind),
+		Position:              request.Position,
+		ObservedAt:            observedAt,
+		CorrectsObservationID: request.CorrectsObservationID,
 	})
 	if err != nil {
 		writeError(w, r, http.StatusConflict, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, operation)
+}
+
+func (h *Handler) WithdrawObservation(w http.ResponseWriter, r *http.Request) {
+	var request withdrawObservationRequest
+	if err := decodeBody(w, r, &request); err != nil {
+		writeError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	report, err := h.runtime.WithdrawObservation(chi.URLParam(r, "runID"), service.WithdrawObservationRequest{
+		ObservationID: request.ObservationID,
+		Reason:        request.Reason,
+	})
+	if err != nil {
+		writeError(w, r, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (h *Handler) Lineage(w http.ResponseWriter, r *http.Request) {
+	report, err := h.runtime.LineageReport(chi.URLParam(r, "runID"))
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (h *Handler) ReviseTracking(w http.ResponseWriter, r *http.Request) {

@@ -20,13 +20,14 @@ type Event struct {
 	Durable bool
 }
 type PassageEvidence struct {
-	RunID      string
-	Station    string
-	SourceID   string
-	Generation int64
-	Position   float64
-	At         time.Time
-	Valid      bool
+	RunID         string
+	Station       string
+	SourceID      string
+	ObservationID string
+	Generation    int64
+	Position      float64
+	At            time.Time
+	Valid         bool
 }
 type RouteLease struct {
 	Route      string
